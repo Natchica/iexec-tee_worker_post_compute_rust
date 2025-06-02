@@ -1,11 +1,13 @@
 use crate::compute::utils::hash_utils::{concatenate_and_hash, sha256};
-use crate::compute::{computed_file::ComputedFile, utils::hash_utils::keccak256};
+use crate::compute::{computed_file::ComputedFile, errors::ReplicateStatusCause, utils::hash_utils::keccak256};
 use log::error;
 use std::{
-    fs::{self, DirEntry},
-    io::Error,
+    fs::{self, DirEntry, File},
+    io::{Error, Read, Write},
     path::Path,
 };
+use walkdir::WalkDir;
+use zip::{write::FileOptions, CompressionMethod, ZipWriter};
 
 /// Computes the result digest for web3 tasks using keccak256 hashing.
 ///
@@ -276,11 +278,339 @@ pub fn get_file_tree_sha256(file_tree_path: &Path) -> String {
     concatenate_and_hash(hashes)
 }
 
+const MAX_RESULT_FILE_NAME_LENGTH: usize = 31;
+
+pub fn check_result_files_name(
+    _task_id: &str, // task_id is not used for now, but might be in the future
+    iexec_out_path: &str,
+) -> Result<(), ReplicateStatusCause> {
+    for entry in WalkDir::new(iexec_out_path).into_iter().filter_map(|e| e.ok()) {
+        if entry.file_type().is_file() {
+            if let Some(file_name) = entry.file_name().to_str() {
+                if file_name.len() > MAX_RESULT_FILE_NAME_LENGTH {
+                    return Err(ReplicateStatusCause::PostComputeTooLongResultFileName);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn zip_folder_recursive<W: Write + std::io::Seek>(
+    zip_writer: &mut ZipWriter<W>,
+    folder_path: &Path,
+    base_path_in_zip: &Path,
+) -> Result<(), ReplicateStatusCause> {
+    for entry in WalkDir::new(folder_path).into_iter().filter_map(|e| e.ok()) {
+        let path = entry.path();
+        let name = path
+            .strip_prefix(folder_path)
+            .map_err(|_| ReplicateStatusCause::PostComputeOutFolderZipFailed)?;
+        let name_in_zip = base_path_in_zip.join(name);
+
+        // Skip symlinks
+        if entry.file_type().is_symlink() {
+            continue;
+        }
+
+        if path.is_file() {
+            zip_writer
+                .start_file::<&str, ()>(
+                    name_in_zip.to_str().unwrap_or(""),
+                    FileOptions::default().compression_method(CompressionMethod::Stored),
+                )
+                .map_err(|_| ReplicateStatusCause::PostComputeOutFolderZipFailed)?;
+            let mut file = File::open(path)
+                .map_err(|_| ReplicateStatusCause::PostComputeOutFolderZipFailed)?;
+            let mut buffer = Vec::new();
+            file.read_to_end(&mut buffer)
+                .map_err(|_| ReplicateStatusCause::PostComputeOutFolderZipFailed)?;
+            zip_writer
+                .write_all(&buffer)
+                .map_err(|_| ReplicateStatusCause::PostComputeOutFolderZipFailed)?;
+        } else if !path.is_symlink() && name.as_os_str() != "" {
+            // Create directory in zip if it's not a symlink and not the root
+            zip_writer
+                .add_directory::<&str, ()>(
+                    name_in_zip.to_str().unwrap_or(""),
+                    FileOptions::default(),
+                )
+                .map_err(|_| ReplicateStatusCause::PostComputeOutFolderZipFailed)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn zip_folder(
+    folder_path: &str,
+    save_in: &str,
+) -> Result<String, ReplicateStatusCause> {
+    let folder_path_p = Path::new(folder_path);
+    let folder_name = folder_path_p
+        .file_name()
+        .ok_or(ReplicateStatusCause::PostComputeOutFolderZipFailed)?
+        .to_str()
+        .ok_or(ReplicateStatusCause::PostComputeOutFolderZipFailed)?;
+
+    let zip_file_name = format!("{}.zip", folder_name);
+    let zip_file_path = Path::new(save_in).join(&zip_file_name);
+
+    let zip_file =
+        File::create(&zip_file_path).map_err(|_| ReplicateStatusCause::PostComputeOutFolderZipFailed)?;
+    let mut zip_writer = ZipWriter::new(zip_file);
+
+    // The base path in the zip file will be the folder name itself
+    let base_path_in_zip = Path::new(folder_name);
+
+    zip_folder_recursive(&mut zip_writer, folder_path_p, base_path_in_zip)?;
+
+    zip_writer
+        .finish()
+        .map_err(|_| ReplicateStatusCause::PostComputeOutFolderZipFailed)?;
+
+    zip_file_path
+        .to_str()
+        .map(String::from)
+        .ok_or(ReplicateStatusCause::PostComputeOutFolderZipFailed)
+}
+
+pub fn zip_iexec_out(
+    iexec_out_path: &str,
+    save_in: &str,
+) -> Result<String, ReplicateStatusCause> {
+    zip_folder(iexec_out_path, save_in)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::Write; // Keep this import as it's used in tests
     use tempfile::tempdir;
+    use zip::ZipArchive;
+
+    // Tests for check_result_files_name function
+    #[test]
+    fn check_result_files_name_should_accept_valid_file_names() {
+        let dir = tempdir().unwrap();
+        let iexec_out = dir.path().join("iexec_out");
+        fs::create_dir(&iexec_out).unwrap();
+
+        let file_path = iexec_out.join("result.txt");
+        let mut file = fs::File::create(&file_path).unwrap();
+        file.write_all(b"test content").unwrap();
+
+        let res = check_result_files_name("task_id_1", iexec_out.to_str().unwrap());
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn check_result_files_name_should_accept_max_length_file_name() {
+        let dir = tempdir().unwrap();
+        let iexec_out = dir.path().join("iexec_out");
+        fs::create_dir(&iexec_out).unwrap();
+
+        let file_name_31_chars = "012345678901234567890123456789a"; // Exactly 31 chars
+        assert_eq!(file_name_31_chars.len(), 31); // This assertion should now pass
+        let file_path = iexec_out.join(file_name_31_chars);
+        let mut file = fs::File::create(&file_path).unwrap();
+        file.write_all(b"test content").unwrap();
+
+        let res = check_result_files_name("task_id_maxlen", iexec_out.to_str().unwrap());
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn check_result_files_name_should_reject_too_long_file_name() {
+        let dir = tempdir().unwrap();
+        let iexec_out = dir.path().join("iexec_out");
+        fs::create_dir(&iexec_out).unwrap();
+
+        let file_path = iexec_out.join("this_is_a_very_long_file_name_that_should_be_rejected.txt");
+        let mut file = fs::File::create(&file_path).unwrap();
+        file.write_all(b"test content").unwrap();
+
+        let res = check_result_files_name("task_id_1", iexec_out.to_str().unwrap());
+        assert!(res.is_err());
+        assert_eq!(
+            res.err().unwrap(),
+            ReplicateStatusCause::PostComputeTooLongResultFileName
+        );
+    }
+
+    #[test]
+    fn check_result_files_name_should_accept_empty_iexec_out() {
+        let dir = tempdir().unwrap();
+        let iexec_out = dir.path().join("iexec_out");
+        fs::create_dir(&iexec_out).unwrap();
+
+        let res = check_result_files_name("task_id_1", iexec_out.to_str().unwrap());
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn check_result_files_name_should_handle_nested_directories() {
+        let dir = tempdir().unwrap();
+        let iexec_out = dir.path().join("iexec_out");
+        fs::create_dir(&iexec_out).unwrap();
+        let nested_dir = iexec_out.join("nested");
+        fs::create_dir(&nested_dir).unwrap();
+
+        let file_path = nested_dir.join("result.txt");
+        let mut file = fs::File::create(&file_path).unwrap();
+        file.write_all(b"test content").unwrap();
+
+        let res = check_result_files_name("task_id_1", iexec_out.to_str().unwrap());
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn check_result_files_name_should_reject_long_file_name_in_nested_directory() {
+        let dir = tempdir().unwrap();
+        let iexec_out = dir.path().join("iexec_out");
+        fs::create_dir(&iexec_out).unwrap();
+        let nested_dir = iexec_out.join("nested");
+        fs::create_dir(&nested_dir).unwrap();
+
+        let file_path = nested_dir.join("this_is_a_very_long_file_name_that_should_be_rejected.txt");
+        let mut file = fs::File::create(&file_path).unwrap();
+        file.write_all(b"test content").unwrap();
+
+        let res = check_result_files_name("task_id_1", iexec_out.to_str().unwrap());
+        assert!(res.is_err());
+        assert_eq!(
+            res.err().unwrap(),
+            ReplicateStatusCause::PostComputeTooLongResultFileName
+        );
+    }
+
+    // Tests for zip_folder and zip_iexec_out functions
+    #[test]
+    fn zip_folder_should_create_zip_file() {
+        let source_dir = tempdir().unwrap();
+        let source_iexec_out = source_dir.path().join("iexec_out");
+        fs::create_dir(&source_iexec_out).unwrap();
+        let file_path = source_iexec_out.join("result.txt");
+        let mut file = fs::File::create(&file_path).unwrap();
+        file.write_all(b"zip test content").unwrap();
+
+        let target_dir = tempdir().unwrap();
+
+        let zip_path_str =
+            zip_folder(source_iexec_out.to_str().unwrap(), target_dir.path().to_str().unwrap()).unwrap();
+        let zip_path = Path::new(&zip_path_str);
+        assert!(zip_path.exists());
+        assert_eq!(zip_path.file_name().unwrap(), "iexec_out.zip");
+
+        // Verify zip content
+        let zip_file = fs::File::open(&zip_path).unwrap();
+        let mut archive = ZipArchive::new(zip_file).unwrap();
+        assert_eq!(archive.len(), 1); // Only one file: iexec_out/result.txt
+        let mut file_in_zip = archive.by_name("iexec_out/result.txt").unwrap();
+        let mut contents = String::new();
+        file_in_zip.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "zip test content");
+    }
+
+    #[test]
+    fn zip_folder_should_skip_symlinks() {
+        // This test might require specific permissions or be platform-dependent (Unix-like for symlinks)
+        if cfg!(unix) {
+            let source_dir = tempdir().unwrap();
+            let source_iexec_out = source_dir.path().join("iexec_out");
+            fs::create_dir(&source_iexec_out).unwrap();
+
+            let file_path = source_iexec_out.join("real_file.txt");
+            let mut file = fs::File::create(&file_path).unwrap();
+            file.write_all(b"some data").unwrap();
+
+            let symlink_path = source_iexec_out.join("symlink_to_file");
+            std::os::unix::fs::symlink(&file_path, &symlink_path).unwrap();
+
+            let target_dir = tempdir().unwrap();
+            let zip_path_str =
+                zip_folder(source_iexec_out.to_str().unwrap(), target_dir.path().to_str().unwrap()).unwrap();
+            let zip_path = Path::new(&zip_path_str);
+            assert!(zip_path.exists());
+
+            let zip_file = fs::File::open(&zip_path).unwrap();
+            let mut archive = ZipArchive::new(zip_file).unwrap();
+            // Should only contain the real file, not the symlink itself as a file entry
+            assert_eq!(archive.len(), 1);
+            assert!(archive.by_name("iexec_out/real_file.txt").is_ok());
+            assert!(archive.by_name("iexec_out/symlink_to_file").is_err());
+        } else {
+            println!("Skipping symlink test on non-unix platform");
+        }
+    }
+
+
+    #[test]
+    fn zip_folder_should_handle_nested_directories() {
+        let source_dir = tempdir().unwrap();
+        let source_iexec_out = source_dir.path().join("iexec_out");
+        fs::create_dir_all(&source_iexec_out.join("nested")).unwrap();
+
+        let file1_path = source_iexec_out.join("file1.txt");
+        fs::File::create(&file1_path).unwrap().write_all(b"file1").unwrap();
+
+        let file2_path = source_iexec_out.join("nested/file2.txt");
+        fs::File::create(&file2_path).unwrap().write_all(b"file2").unwrap();
+
+        let target_dir = tempdir().unwrap();
+        let zip_path_str =
+            zip_folder(source_iexec_out.to_str().unwrap(), target_dir.path().to_str().unwrap()).unwrap();
+        let zip_path = Path::new(&zip_path_str);
+        assert!(zip_path.exists());
+
+        let zip_file = fs::File::open(&zip_path).unwrap();
+        let mut archive = ZipArchive::new(zip_file).unwrap();
+        assert_eq!(archive.len(), 3); // iexec_out/file1.txt, iexec_out/nested/, iexec_out/nested/file2.txt
+        assert!(archive.by_name("iexec_out/file1.txt").is_ok());
+        assert!(archive.by_name("iexec_out/nested/").is_ok());
+        assert!(archive.by_name("iexec_out/nested/file2.txt").is_ok());
+
+        let mut f2_in_zip = archive.by_name("iexec_out/nested/file2.txt").unwrap();
+        let mut contents = String::new();
+        f2_in_zip.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "file2");
+    }
+
+    #[test]
+    fn zip_iexec_out_should_call_zip_folder() {
+        let source_dir = tempdir().unwrap();
+        let source_iexec_out = source_dir.path().join("iexec_out");
+        fs::create_dir(&source_iexec_out).unwrap();
+        let file_path = source_iexec_out.join("result.txt");
+        let mut file = fs::File::create(&file_path).unwrap();
+        file.write_all(b"zip test content").unwrap();
+
+        let target_dir = tempdir().unwrap();
+
+        let zip_path_str =
+            zip_iexec_out(source_iexec_out.to_str().unwrap(), target_dir.path().to_str().unwrap())
+                .unwrap();
+        let zip_path = Path::new(&zip_path_str);
+        assert!(zip_path.exists());
+        assert_eq!(zip_path.file_name().unwrap(), "iexec_out.zip");
+    }
+
+    #[test]
+    fn zip_folder_empty_dir() {
+        let source_dir = tempdir().unwrap();
+        let source_iexec_out = source_dir.path().join("iexec_out");
+        fs::create_dir(&source_iexec_out).unwrap();
+
+        let target_dir = tempdir().unwrap();
+        let zip_path_str =
+            zip_folder(source_iexec_out.to_str().unwrap(), target_dir.path().to_str().unwrap()).unwrap();
+        let zip_path = Path::new(&zip_path_str);
+        assert!(zip_path.exists());
+
+        let zip_file = fs::File::open(&zip_path).unwrap();
+        let archive = ZipArchive::new(zip_file).unwrap();
+        assert_eq!(archive.len(), 0); // Empty archive
+    }
+
 
     #[test]
     fn compute_web3_result_digest_returns_digest_when_valid_input() {

@@ -23,4 +23,14 @@ pub enum ReplicateStatusCause {
     PostComputeTeeChallengePrivateKeyMissing,
     #[error("Worker address related environment variable is missing")]
     PostComputeWorkerAddressMissing,
+    #[error("Failed to zip output folder")]
+    PostComputeOutFolderZipFailed,
+    #[error("Result file not found")]
+    PostComputeResultFileNotFound,
+    #[error("Failed to upload result to IPFS")]
+    PostComputeIpfsUploadFailed,
+    #[error("Storage token is missing")]
+    PostComputeStorageTokenMissing,
+    #[error("Result file name is too long")]
+    PostComputeTooLongResultFileName,
 }
